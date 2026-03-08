@@ -1,1 +1,11 @@
-/toolchain
+# Build artifacts
+toolchain/build/
+toolchain/inst/
+toolchain/dl/
+firmware/
+target_firmware/*.fw
+
+# Editor
+*.swp
+*.swo
+*~
