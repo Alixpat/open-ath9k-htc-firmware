@@ -23,7 +23,7 @@ Le firmware stock de l'AR9271 ignore les demandes de débit (rate) du driver Lin
 ## Prérequis
 
 ```bash
-sudo apt install build-essential cmake git m4 texinfo
+sudo apt install build-essential cmake git m4 texinfo wget
 ```
 
 ## Compilation
