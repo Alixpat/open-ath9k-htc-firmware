@@ -1386,8 +1386,140 @@ static void ath_node_update_tgt(void *Context, A_UINT16 Command,
 	wmi_cmd_rsp(sc->tgt_wmi_handle, Command, SeqNo, NULL, 0);
 }
 
+/*
+ * Labo IQ : registres virtuels servis par les commandes WMI de lecture/écriture
+ * de registres. Le firmware échantillonne (ou rejoue) un registre du baseband
+ * à cadence fixe, bien plus vite que l'hôte ne peut le faire par USB.
+ *
+ *   IQ_BASE+0x00  ID       (lecture)  0x49510001
+ *        +0x04  SRC      registre MAC/BB lu par la capture
+ *        +0x08  DST      registre MAC/BB écrit par la relecture
+ *        +0x0c  COUNT    nombre d'échantillons (<= BUFLEN)
+ *        +0x10  PERIOD   période en cycles CPU (0 = au plus vite)
+ *        +0x14  REPEAT   nombre de passes de relecture
+ *        +0x18  CTRL     écrire 1 = capture, 2 = relecture (bloquant)
+ *        +0x1c  ELAPSED  (lecture) durée de la dernière opération, en cycles CPU
+ *        +0x20  BUFLEN   (lecture) taille du tampon, en mots
+ *        +0x1000 + 4*i   mot i du tampon (lecture/écriture)
+ */
+#define IQ_BASE		0x49510000
+#define IQ_MAGIC	0x49510001
+#define IQ_BUF_OFF	0x1000
+
+static struct {
+	a_uint32_t src, dst, count, period, repeat, elapsed, buflen;
+	a_uint32_t *buf;
+} iq_lab;
+
+static inline a_uint32_t iq_ccount(void)
+{
+	a_uint32_t c;
+
+	asm volatile("rsr %0, ccount" : "=r" (c));
+	return c;
+}
+
+static inline int iq_is_virtual(a_uint32_t addr)
+{
+	return (addr & 0xffff0000) == IQ_BASE;
+}
+
+static void iq_alloc(void)
+{
+	a_uint32_t words;
+
+	if (iq_lab.buf)
+		return;
+	for (words = 1024; words >= 64 && !iq_lab.buf; words >>= 1) {
+		iq_lab.buf = (a_uint32_t *)A_ALLOCRAM(words * 4);
+		if (iq_lab.buf)
+			iq_lab.buflen = words;
+	}
+}
+
+static void iq_run(a_uint32_t op)
+{
+	a_uint32_t n = iq_lab.count, period = iq_lab.period;
+	a_uint32_t i, r, t0, t;
+
+	iq_alloc();
+	if (!iq_lab.buf)
+		return;
+	if (n > iq_lab.buflen)
+		n = iq_lab.buflen;
+
+	A_WDT_TASK();
+	t0 = t = iq_ccount();
+	if (op == 1) {
+		for (i = 0; i < n; i++) {
+			iq_lab.buf[i] = ioread32_mac(iq_lab.src);
+			t += period;
+			while ((a_int32_t)(iq_ccount() - t) < 0)
+				;
+		}
+	} else if (op == 2) {
+		for (r = 0; r < iq_lab.repeat; r++) {
+			for (i = 0; i < n; i++) {
+				iowrite32_mac(iq_lab.dst, iq_lab.buf[i]);
+				t += period;
+				while ((a_int32_t)(iq_ccount() - t) < 0)
+					;
+			}
+			A_WDT_TASK();
+		}
+	}
+	iq_lab.elapsed = iq_ccount() - t0;
+	A_WDT_TASK();
+}
+
+static a_uint32_t iq_virtual_read(a_uint32_t addr)
+{
+	a_uint32_t off = addr & 0xffff;
+
+	if (off >= IQ_BUF_OFF) {
+		off = (off - IQ_BUF_OFF) >> 2;
+		iq_alloc();
+		return (iq_lab.buf && off < iq_lab.buflen) ? iq_lab.buf[off] : 0;
+	}
+	switch (off) {
+	case 0x00: return IQ_MAGIC;
+	case 0x04: return iq_lab.src;
+	case 0x08: return iq_lab.dst;
+	case 0x0c: return iq_lab.count;
+	case 0x10: return iq_lab.period;
+	case 0x14: return iq_lab.repeat;
+	case 0x1c: return iq_lab.elapsed;
+	case 0x20: iq_alloc(); return iq_lab.buflen;
+	}
+	return 0;
+}
+
+static void iq_virtual_write(a_uint32_t addr, a_uint32_t val)
+{
+	a_uint32_t off = addr & 0xffff;
+
+	if (off >= IQ_BUF_OFF) {
+		off = (off - IQ_BUF_OFF) >> 2;
+		iq_alloc();
+		if (iq_lab.buf && off < iq_lab.buflen)
+			iq_lab.buf[off] = val;
+		return;
+	}
+	switch (off) {
+	case 0x04: iq_lab.src = val & 0xfffc; break;
+	case 0x08: iq_lab.dst = val & 0xfffc; break;
+	case 0x0c: iq_lab.count = val; break;
+	case 0x10: iq_lab.period = val; break;
+	case 0x14: iq_lab.repeat = val; break;
+	case 0x18: iq_run(val); break;
+	}
+}
+
 static a_int32_t ath_reg_read_filter(struct ath_hal *ah, a_int32_t addr)
 {
+	if (iq_is_virtual(addr))
+		return iq_virtual_read(addr);
+
 	if ((addr & 0xffffe000) == 0x2000) {
 		/* SEEPROM registers */
 		ioread32_mac(addr);
@@ -1452,6 +1584,11 @@ static void ath_pll_reset_ones(struct ath_hal *ah)
 static void ath_hal_reg_write_filter(struct ath_hal *ah,
 			a_uint32_t reg, a_uint32_t val)
 {
+	if (iq_is_virtual(reg)) {
+		iq_virtual_write(reg, val);
+		return;
+	}
+
 	if(reg > 0xffff) {
 		iowrite32(reg, val);
 #if defined(PROJECT_K2)
