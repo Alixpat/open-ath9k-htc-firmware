@@ -1432,6 +1432,9 @@ static void ath_node_update_tgt(void *Context, A_UINT16 Command,
  *        +0x3c  (lecture) échantillons en attente ; +0x40 trames reçues ;
  *        +0x44  trames refusées (file pleine) ; +0x48 pannes d'échantillons ;
  *        +0x4c  taille de la file, en échantillons
+ *        +0x50  (lecture) mémoire encore libre, en octets
+ *        +0x54  valeur de repos de 0x7868, remise par le firmware s'il ne reçoit
+ *               plus d'échantillons pendant ~1 s (sécurité) ; +0x58 flux actif
  *        +0x1000 + 4*i   mot i du tampon (lecture/écriture)
  *
  * Flux d'émission : l'hôte injecte des trames de données destinées à
@@ -1474,17 +1477,34 @@ static inline int iq_is_virtual(a_uint32_t addr)
 	return (addr & 0xffff0000) == IQ_BASE;
 }
 
+static a_uint32_t iq_mem_free(void);
+static a_uint32_t iq_blk_bytes;	/* taille du bloc alloué (sert aussi de file d'émission) */
+
+#define IQ_BLK_MAX	28672	/* octets */
+#define IQ_MEM_MARGE	1024	/* laissé libre pour le reste du firmware */
+
+/*
+ * Un seul bloc pour tout le labo, dimensionné sur la mémoire réellement
+ * libre : A_ALLOCRAM bloque le firmware si on lui demande plus qu'il ne reste.
+ * La capture/relecture en utilise les 1024 premiers mots, la file d'émission
+ * le bloc entier (jamais en même temps).
+ */
 static void iq_alloc(void)
 {
-	a_uint32_t words;
+	a_uint32_t libre, bytes;
 
 	if (iq_lab.buf)
 		return;
-	for (words = 1024; words >= 64 && !iq_lab.buf; words >>= 1) {
-		iq_lab.buf = (a_uint32_t *)A_ALLOCRAM(words * 4);
-		if (iq_lab.buf)
-			iq_lab.buflen = words;
-	}
+	libre = iq_mem_free();
+	bytes = (libre > IQ_MEM_MARGE) ? libre - IQ_MEM_MARGE : 0;
+	if (bytes > IQ_BLK_MAX)
+		bytes = IQ_BLK_MAX;
+	bytes -= bytes % 12;
+	if (bytes < 256)
+		return;
+	iq_lab.buf = (a_uint32_t *)A_ALLOCRAM(bytes);
+	iq_blk_bytes = bytes;
+	iq_lab.buflen = (bytes / 4 > 1024) ? 1024 : bytes / 4;
 }
 
 static void iq_run(a_uint32_t op)
@@ -1599,14 +1619,26 @@ static a_uint32_t iq_tx_head, iq_tx_tail, iq_tx_fill;
 static a_uint32_t iq_tx_period = 1170, iq_tx_next;
 static a_uint32_t iq_tx_cnt[3];		/* trames reçues, refusées, pannes */
 static a_uint8_t iq_tx_on, iq_tx_running, iq_rx_on;
+static a_uint32_t iq_tx_safe_top2, iq_tx_idle_since;
+
+#define IQ_TX_PERIOD_MIN	585		/* 200 kéch/s : au-delà le firmware ne répond plus */
+#define IQ_TX_IDLE_MAX		117000000	/* ~1 s sans échantillon : arrêt de l'émission */
+#define IQ_DAC_ZERO		0x00200400
 
 #define IQ_TX_BLOCK	256
 
 /*
- * La file d'émission réutilise le tampon de capture/relecture (4 Ko) : une
- * demande de mémoire trop grande à A_ALLOCRAM bloque le firmware au lieu
- * d'échouer proprement.
+ * Mémoire encore libre dans la zone d'allocation, qui va de la fin de l'image
+ * au début de la pile.
  */
+static a_uint32_t iq_mem_free(void)
+{
+	a_uint32_t fin = SYS_D_RAM_REGION_0_BASE + SYS_RAM_SZIE - SYS_D_RAM_STACK_SIZE;
+	a_uint32_t p = (a_uint32_t)A_ALLOCRAM(4) + 4;
+
+	return (p < fin) ? fin - p : 0;
+}
+
 static void iq_tx_alloc(void)
 {
 	if (iq_tx_ring)
@@ -1614,7 +1646,7 @@ static void iq_tx_alloc(void)
 	iq_alloc();
 	if (iq_lab.buf) {
 		iq_tx_ring = (a_uint8_t *)iq_lab.buf;
-		iq_tx_size = iq_lab.buflen * 4 / 3;
+		iq_tx_size = iq_blk_bytes / 3;
 	}
 }
 
@@ -1652,18 +1684,39 @@ static int iq_tx_frame(struct ath_softc_tgt *sc, a_uint8_t *f, a_uint32_t len)
 
 static void iq_tx_poll(void)
 {
-	a_uint32_t n, i, dst = iq_lab.dst, period = iq_tx_period, t;
+	a_uint32_t n, i, dst = iq_lab.dst, period = iq_tx_period, t, blk;
 
 	if (!iq_tx_running) {
 		/* attendre une demi-file avant de (re)partir */
-		if (iq_tx_fill < iq_tx_size / 2)
+		if (iq_tx_fill < iq_tx_size / 2) {
+			/*
+			 * Sécurité : plus d'échantillons depuis ~1 s (hôte arrêté
+			 * ou planté) : DAC à zéro, chaîne d'émission relâchée.
+			 */
+			if (iq_ccount() - iq_tx_idle_since > IQ_TX_IDLE_MAX) {
+				iowrite32_mac(dst, IQ_DAC_ZERO);
+				iowrite32_mac(0x9808, 0);
+				if (iq_tx_safe_top2)
+					iowrite32_mac(0x7868, iq_tx_safe_top2);
+				iq_tx_on = 0;
+			}
 			return;
+		}
 		iq_tx_next = iq_ccount();
 		iq_tx_running = 1;
 	}
+	/*
+	 * Bloc d'environ 1 ms : au-delà, la boucle principale tourne trop
+	 * lentement et les commandes de l'hôte mettent des dizaines de ms.
+	 */
+	blk = period ? 117000 / period : IQ_TX_BLOCK;
+	if (blk < 16)
+		blk = 16;
+	if (blk > IQ_TX_BLOCK)
+		blk = IQ_TX_BLOCK;
 	n = iq_tx_fill;
-	if (n > IQ_TX_BLOCK)
-		n = IQ_TX_BLOCK;
+	if (n > blk)
+		n = blk;
 	t = iq_tx_next;
 	for (i = 0; i < n; i++) {
 		a_uint8_t *d = iq_tx_ring + iq_tx_tail * 3;
@@ -1680,6 +1733,7 @@ static void iq_tx_poll(void)
 	if (iq_tx_fill == 0) {
 		iq_tx_cnt[2]++;
 		iq_tx_running = 0;
+		iq_tx_idle_since = iq_ccount();
 	}
 }
 
@@ -1716,6 +1770,9 @@ static a_uint32_t iq_virtual_read(a_uint32_t addr)
 	case 0x44: return iq_tx_cnt[1];
 	case 0x48: return iq_tx_cnt[2];
 	case 0x4c: iq_tx_alloc(); return iq_tx_size;
+	case 0x50: return iq_mem_free();
+	case 0x54: return iq_tx_safe_top2;
+	case 0x58: return iq_tx_on;
 	case 0x28: return iq_cnt[0];
 	case 0x2c: return iq_cnt[1];
 	case 0x30: return iq_cnt[2];
@@ -1752,6 +1809,7 @@ static void iq_virtual_write(a_uint32_t addr, a_uint32_t val)
 			iq_tx_head = iq_tx_tail = iq_tx_fill = 0;
 			iq_tx_running = 0;
 			iq_tx_cnt[0] = iq_tx_cnt[1] = iq_tx_cnt[2] = 0;
+			iq_tx_idle_since = iq_ccount();
 			iq_tx_on = 1;
 			lab_poll_hook = lab_poll;
 		} else if (val == 6) {
@@ -1760,7 +1818,8 @@ static void iq_virtual_write(a_uint32_t addr, a_uint32_t val)
 			iq_run(val);
 		break;
 	case 0x24: iq_stream_n = val; break;
-	case 0x38: iq_tx_period = val; break;
+	case 0x38: iq_tx_period = (val < IQ_TX_PERIOD_MIN) ? IQ_TX_PERIOD_MIN : val; break;
+	case 0x54: iq_tx_safe_top2 = val; break;
 	}
 }
 

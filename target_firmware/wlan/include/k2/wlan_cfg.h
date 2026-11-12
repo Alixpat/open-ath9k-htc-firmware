@@ -51,7 +51,7 @@
 #else
 
 #ifdef RX_SCATTER
-#define ATH_RXDESC  11     /* number of RX descriptors */
+#define ATH_RXDESC  5      /* number of RX descriptors (11 d'origine ; réduit pour libérer ~10 Ko pour la file I/Q) */
 #endif   // end of _DEBUG_BUILD
 
 #ifdef RX_SCATTER
