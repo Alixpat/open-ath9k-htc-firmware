@@ -601,6 +601,24 @@ void ath_tx_status_update_aggr(struct ath_softc_tgt *sc, struct ath_tx_buf *bf,
 	txs->cnt++;
 }
 
+/* Labo : rend compte à l'hôte d'une trame absorbée par le flux I/Q d'émission. */
+void ath_tx_status_lab(struct ath_softc_tgt *sc, a_uint8_t cookie, a_uint8_t endpt)
+{
+	WMI_TXSTATUS_EVENT *txs;
+
+	if (sc->sc_tx_draining)
+		return;
+
+	txs = ath_tx_status_get(sc);
+	if (txs == NULL)
+		return;
+
+	txs->txstatus[txs->cnt].cookie = cookie;
+	txs->txstatus[txs->cnt].ts_rate = SM(endpt, ATH9K_HTC_TXSTAT_EPID);
+	txs->txstatus[txs->cnt].ts_flags = ATH9K_HTC_TXSTAT_ACK;
+	txs->cnt++;
+}
+
 void ath_tx_status_send(struct ath_softc_tgt *sc)
 {
 	int i;

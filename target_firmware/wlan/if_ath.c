@@ -737,6 +737,10 @@ static void tgt_HTCRecv_mgmthandler(HTC_ENDPOINT_ID EndPt, adf_nbuf_t hdr_buf,
 	ath_tgt_send_mgt(sc,hdr_buf,buf,EndPt);
 }
 
+void ath_tx_status_lab(struct ath_softc_tgt *sc, a_uint8_t cookie, a_uint8_t endpt);
+void ath_tx_status_send(struct ath_softc_tgt *sc);
+static int iq_tx_frame(struct ath_softc_tgt *sc, a_uint8_t *frame, a_uint32_t len);
+
 static void tgt_HTCRecvMessageHandler(HTC_ENDPOINT_ID EndPt,
 				      adf_nbuf_t hdr_buf, adf_nbuf_t buf,
 				      void *ServiceCtx)
@@ -758,6 +762,15 @@ static void tgt_HTCRecvMessageHandler(HTC_ENDPOINT_ID EndPt,
 
 	adf_os_assert(len >= sizeof(ath_data_hdr_t));
 	dh = (ath_data_hdr_t *)data;
+
+	/* Labo : trame d'échantillons pour le flux I/Q d'émission (jamais émise telle quelle) */
+	if (!hdr_buf && len > sizeof(ath_data_hdr_t) + 36 &&
+	    iq_tx_frame(sc, data + sizeof(ath_data_hdr_t), len - sizeof(ath_data_hdr_t))) {
+		ath_tx_status_lab(sc, dh->cookie, EndPt);
+		ath_tx_status_send(sc);
+		ath_free_tx_skb(sc->tgt_htc_handle, EndPt, buf);
+		return;
+	}
 
 	an = &sc->sc_sta[dh->ni_index];
 	tid = ATH_AN_2_TID(an, dh->tidno);
@@ -1410,11 +1423,21 @@ static void ath_node_update_tgt(void *Context, A_UINT16 Command,
  *        +0x10  PERIOD   période en cycles CPU (0 = au plus vite)
  *        +0x14  REPEAT   nombre de passes de relecture
  *        +0x18  CTRL     écrire 1 = capture, 2 = relecture (bloquant),
- *                        3 = démarrer le flux, 4 = arrêter le flux
+ *                        3 = démarrer le flux, 4 = arrêter le flux,
+ *                        5 = démarrer le flux d'émission, 6 = l'arrêter
  *        +0x1c  ELAPSED  (lecture) durée de la dernière opération, en cycles CPU
  *        +0x20  BUFLEN   (lecture) taille du tampon, en mots
  *        +0x24  STREAM_N échantillons par trame de flux (<= 500)
+ *        +0x38  TX_PERIOD période d'émission, en cycles CPU
+ *        +0x3c  (lecture) échantillons en attente ; +0x40 trames reçues ;
+ *        +0x44  trames refusées (file pleine) ; +0x48 pannes d'échantillons ;
+ *        +0x4c  taille de la file, en échantillons
  *        +0x1000 + 4*i   mot i du tampon (lecture/écriture)
+ *
+ * Flux d'émission : l'hôte injecte des trames de données destinées à
+ * 02:49:51:00:00:02 : 'AIQT', numéro (4 o), nombre (2 o), réservé (2 o), puis
+ * 3 octets par échantillon (valeur de DST, gros-boutiste). Le firmware les met
+ * en file et les écrit dans DST à la cadence TX_PERIOD.
  *
  * Flux : à chaque tour de la boucle principale, si la trame précédente est
  * partie, le firmware lit STREAM_N fois SRC à la cadence PERIOD et envoie le
@@ -1569,6 +1592,105 @@ static void iq_poll(void)
 	HTC_SendMsg(sc->tgt_htc_handle, RX_ENDPOINT_ID, skb);
 }
 
+/* ---- flux d'émission ---- */
+static a_uint8_t *iq_tx_ring;
+static a_uint32_t iq_tx_size;		/* capacité, en échantillons */
+static a_uint32_t iq_tx_head, iq_tx_tail, iq_tx_fill;
+static a_uint32_t iq_tx_period = 1170, iq_tx_next;
+static a_uint32_t iq_tx_cnt[3];		/* trames reçues, refusées, pannes */
+static a_uint8_t iq_tx_on, iq_tx_running, iq_rx_on;
+
+#define IQ_TX_BLOCK	256
+
+/*
+ * La file d'émission réutilise le tampon de capture/relecture (4 Ko) : une
+ * demande de mémoire trop grande à A_ALLOCRAM bloque le firmware au lieu
+ * d'échouer proprement.
+ */
+static void iq_tx_alloc(void)
+{
+	if (iq_tx_ring)
+		return;
+	iq_alloc();
+	if (iq_lab.buf) {
+		iq_tx_ring = (a_uint8_t *)iq_lab.buf;
+		iq_tx_size = iq_lab.buflen * 4 / 3;
+	}
+}
+
+/* Renvoie 1 si la trame est une trame d'échantillons (elle est alors consommée). */
+static int iq_tx_frame(struct ath_softc_tgt *sc, a_uint8_t *f, a_uint32_t len)
+{
+	a_uint32_t n, i;
+	a_uint8_t *p;
+
+	if (f[4] != 0x02 || f[5] != 0x49 || f[6] != 0x51 || f[7] != 0x00 ||
+	    f[8] != 0x00 || f[9] != 0x02)
+		return 0;
+	if (f[24] != 'A' || f[25] != 'I' || f[26] != 'Q' || f[27] != 'T')
+		return 0;
+
+	n = (f[32] << 8) | f[33];
+	if (!iq_tx_on || !iq_tx_ring || 36 + n * 3 > len ||
+	    iq_tx_fill + n > iq_tx_size) {
+		iq_tx_cnt[1]++;
+		return 1;
+	}
+	p = f + 36;
+	for (i = 0; i < n; i++) {
+		a_uint8_t *d = iq_tx_ring + iq_tx_head * 3;
+
+		d[0] = p[0]; d[1] = p[1]; d[2] = p[2];
+		p += 3;
+		if (++iq_tx_head == iq_tx_size)
+			iq_tx_head = 0;
+	}
+	iq_tx_fill += n;
+	iq_tx_cnt[0]++;
+	return 1;
+}
+
+static void iq_tx_poll(void)
+{
+	a_uint32_t n, i, dst = iq_lab.dst, period = iq_tx_period, t;
+
+	if (!iq_tx_running) {
+		/* attendre une demi-file avant de (re)partir */
+		if (iq_tx_fill < iq_tx_size / 2)
+			return;
+		iq_tx_next = iq_ccount();
+		iq_tx_running = 1;
+	}
+	n = iq_tx_fill;
+	if (n > IQ_TX_BLOCK)
+		n = IQ_TX_BLOCK;
+	t = iq_tx_next;
+	for (i = 0; i < n; i++) {
+		a_uint8_t *d = iq_tx_ring + iq_tx_tail * 3;
+
+		while ((a_int32_t)(iq_ccount() - t) < 0)
+			;
+		iowrite32_mac(dst, (d[0] << 16) | (d[1] << 8) | d[2]);
+		t += period;
+		if (++iq_tx_tail == iq_tx_size)
+			iq_tx_tail = 0;
+	}
+	iq_tx_next = t;
+	iq_tx_fill -= n;
+	if (iq_tx_fill == 0) {
+		iq_tx_cnt[2]++;
+		iq_tx_running = 0;
+	}
+}
+
+static void lab_poll(void)
+{
+	if (iq_rx_on)
+		iq_poll();
+	if (iq_tx_on)
+		iq_tx_poll();
+}
+
 static a_uint32_t iq_virtual_read(a_uint32_t addr)
 {
 	a_uint32_t off = addr & 0xffff;
@@ -1588,6 +1710,12 @@ static a_uint32_t iq_virtual_read(a_uint32_t addr)
 	case 0x1c: return iq_lab.elapsed;
 	case 0x20: iq_alloc(); return iq_lab.buflen;
 	case 0x24: return iq_stream_n;
+	case 0x38: return iq_tx_period;
+	case 0x3c: return iq_tx_fill;
+	case 0x40: return iq_tx_cnt[0];
+	case 0x44: return iq_tx_cnt[1];
+	case 0x48: return iq_tx_cnt[2];
+	case 0x4c: iq_tx_alloc(); return iq_tx_size;
 	case 0x28: return iq_cnt[0];
 	case 0x2c: return iq_cnt[1];
 	case 0x30: return iq_cnt[2];
@@ -1614,14 +1742,25 @@ static void iq_virtual_write(a_uint32_t addr, a_uint32_t val)
 	case 0x10: iq_lab.period = val; break;
 	case 0x14: iq_lab.repeat = val; break;
 	case 0x18:
-		if (val == 3)
-			lab_poll_hook = iq_poll;
-		else if (val == 4)
-			lab_poll_hook = NULL;
-		else
+		if (val == 3) {
+			iq_rx_on = 1;
+			lab_poll_hook = lab_poll;
+		} else if (val == 4) {
+			iq_rx_on = 0;
+		} else if (val == 5) {
+			iq_tx_alloc();
+			iq_tx_head = iq_tx_tail = iq_tx_fill = 0;
+			iq_tx_running = 0;
+			iq_tx_cnt[0] = iq_tx_cnt[1] = iq_tx_cnt[2] = 0;
+			iq_tx_on = 1;
+			lab_poll_hook = lab_poll;
+		} else if (val == 6) {
+			iq_tx_on = 0;
+		} else
 			iq_run(val);
 		break;
 	case 0x24: iq_stream_n = val; break;
+	case 0x38: iq_tx_period = val; break;
 	}
 }
 
