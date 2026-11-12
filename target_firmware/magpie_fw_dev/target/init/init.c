@@ -70,6 +70,9 @@ int (* save_cmnos_printf)(const char * fmt, ...);
 
 static void idle_task();
 
+/* Labo : fonction appelée à chaque tour de la boucle principale (flux I/Q). */
+void (*lab_poll_hook)(void);
+
 #if defined(PROJECT_MAGPIE)
 void fatal_exception_func()
 {
@@ -369,6 +372,9 @@ void __noreturn wlan_task(void)
 
 		A_TASKLET_RUN();
 		A_TIMER_RUN();
+
+		if (lab_poll_hook)
+			lab_poll_hook();
 
 		/* Very low priority tasks */
 		if ((loop_low & 0x1fff) == 0x7)
