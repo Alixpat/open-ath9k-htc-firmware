@@ -312,17 +312,21 @@ static void ath_rx_complete(struct ath_softc_tgt *sc, adf_nbuf_t buf)
 }
 
 #define IQ_POOL_ID	4	/* identifiant de réserve libre (< POOL_ID_MAX) */
-static adf_nbuf_t iq_inflight;	/* trame du flux I/Q en cours d'envoi */
+static adf_nbuf_t iq_inflight[2];	/* trames du flux I/Q en cours d'envoi (deux tampons) */
 static a_uint32_t iq_cnt[4];	/* tours, sans tampon, envoyées, terminées */
 
 static void tgt_HTCSendCompleteHandler(HTC_ENDPOINT_ID Endpt, adf_nbuf_t buf, void *ServiceCtx)
 {
 	struct ath_softc_tgt *sc = (struct ath_softc_tgt *)ServiceCtx;
 
-	if (Endpt == RX_ENDPOINT_ID && buf == iq_inflight) {
+	if (Endpt == RX_ENDPOINT_ID && buf != ADF_NBUF_NULL &&
+	    (buf == iq_inflight[0] || buf == iq_inflight[1])) {
 		/* trame du flux I/Q : rendre le tampon, sans toucher à l'anneau de réception */
 		BUF_Pool_free_buf(sc->pool_handle, IQ_POOL_ID, buf);
-		iq_inflight = ADF_NBUF_NULL;
+		if (buf == iq_inflight[0])
+			iq_inflight[0] = ADF_NBUF_NULL;
+		else
+			iq_inflight[1] = ADF_NBUF_NULL;
 		iq_cnt[3]++;
 		return;
 	}
@@ -1427,7 +1431,7 @@ static void ath_node_update_tgt(void *Context, A_UINT16 Command,
  *                        5 = démarrer le flux d'émission, 6 = l'arrêter
  *        +0x1c  ELAPSED  (lecture) durée de la dernière opération, en cycles CPU
  *        +0x20  BUFLEN   (lecture) taille du tampon, en mots
- *        +0x24  STREAM_N échantillons par trame de flux (<= 500)
+ *        +0x24  STREAM_N échantillons par trame de flux (<= 680, et ~8 ms au plus)
  *        +0x38  TX_PERIOD période d'émission, en cycles CPU
  *        +0x3c  (lecture) échantillons en attente ; +0x40 trames reçues ;
  *        +0x44  trames refusées (file pleine) ; +0x48 pannes d'échantillons ;
@@ -1445,8 +1449,11 @@ static void ath_node_update_tgt(void *Context, A_UINT16 Command,
  * Flux : à chaque tour de la boucle principale, si la trame précédente est
  * partie, le firmware lit STREAM_N fois SRC à la cadence PERIOD et envoie le
  * bloc à l'hôte comme une trame de données reçue (émetteur 02:49:51:00:00:01) :
- *   'AIQ1', numéro (4 o), ccount du 1er échantillon (4 o), période (4 o),
- *   nombre (2 o), registre (2 o), puis 3 octets par échantillon (gros-boutiste).
+ *   'AIQ2', numéro (4 o), ccount du 1er échantillon (4 o), numéro du 1er
+ *   échantillon sur la grille (4 o), nombre (2 o), registre (2 o), puis
+ *   18 bits par échantillon rangés bout à bout (gros-boutiste).
+ * +0x5c durée de l'envoi d'une trame, +0x60 temps mort entre deux blocs (cycles),
+ * +0x64 échantillons sautés depuis le démarrage du flux.
  */
 #define IQ_BASE		0x49510000
 #define IQ_MAGIC	0x49510001
@@ -1461,7 +1468,7 @@ extern void (*lab_poll_hook)(void);
 static struct ath_softc_tgt *iq_sc;
 static a_uint32_t iq_stream_n = 480, iq_seq;
 
-#define IQ_STREAM_MAX	500
+#define IQ_STREAM_MAX	680
 #define IQ_STREAM_HDR	20
 
 static inline a_uint32_t iq_ccount(void)
@@ -1542,6 +1549,9 @@ static void iq_run(a_uint32_t op)
 	A_WDT_TASK();
 }
 
+static a_uint32_t iq_rx_next, iq_rx_idx, iq_rx_t_end, iq_rx_stat[3];
+static a_uint8_t iq_rx_grid;
+
 static void iq_poll(void)
 {
 	static const a_uint8_t dot11[24] = {
@@ -1555,13 +1565,21 @@ static void iq_poll(void)
 	adf_nbuf_t skb;
 	a_uint8_t *p, *hdr;
 	a_uint32_t n = iq_stream_n, period = iq_lab.period, src = iq_lab.src;
-	a_uint32_t i, t, v, len;
+	a_uint32_t i, t, t0, v, len, acc = 0, bits = 0, now, k;
 
 	iq_cnt[0]++;
-	if (iq_inflight || !sc)
+	if ((iq_inflight[0] && iq_inflight[1]) || !sc)
 		return;
 	if (n > IQ_STREAM_MAX)
 		n = IQ_STREAM_MAX;
+	/* bloc d'environ 8 ms au plus, pour ne pas retenir la boucle principale */
+	if (period) {
+		k = 936000 / period;
+		if (k < 8)
+			k = 8;
+		if (n > k)
+			n = k;
+	}
 
 	skb = BUF_Pool_alloc_buf_align(sc->pool_handle, IQ_POOL_ID,
 				       RX_HEADER_SPACE, sc->sc_cachelsz);
@@ -1570,31 +1588,59 @@ static void iq_poll(void)
 		return;
 	}
 
-	len = sizeof(dot11) + IQ_STREAM_HDR + n * 3 + 4;
+	len = sizeof(dot11) + IQ_STREAM_HDR + (n * 18 + 7) / 8 + 4;
 	p = adf_nbuf_put_tail(skb, len);
 	adf_os_mem_copy(p, dot11, sizeof(dot11));
 	p += sizeof(dot11);
 	hdr = p;
 	p += IQ_STREAM_HDR;
 
-	t = iq_ccount();
-	hdr[0] = 'A'; hdr[1] = 'I'; hdr[2] = 'Q'; hdr[3] = '1';
+	/*
+	 * Grille d'échantillonnage : le bloc reprend à l'instant prévu du
+	 * prochain échantillon. S'il est déjà passé (temps d'envoi de la trame
+	 * précédente), on saute un nombre entier d'échantillons : l'hôte les
+	 * voit au numéro d'échantillon de l'en-tête.
+	 */
+	now = iq_ccount();
+	iq_rx_stat[1] = now - iq_rx_t_end;	/* temps mort depuis la fin du bloc précédent */
+	if (!iq_rx_grid || !period) {
+		iq_rx_next = now;
+		iq_rx_grid = 1;
+	} else if ((a_int32_t)(now - iq_rx_next) > 0) {
+		k = (now - iq_rx_next + period - 1) / period;
+		iq_rx_next += k * period;
+		iq_rx_idx += k;
+		iq_rx_stat[2] += k;		/* échantillons sautés, cumul */
+	}
+	t = t0 = iq_rx_next;
+
+	hdr[0] = 'A'; hdr[1] = 'I'; hdr[2] = 'Q'; hdr[3] = '2';
 	hdr[4] = iq_seq >> 24; hdr[5] = iq_seq >> 16; hdr[6] = iq_seq >> 8; hdr[7] = iq_seq;
-	hdr[8] = t >> 24; hdr[9] = t >> 16; hdr[10] = t >> 8; hdr[11] = t;
-	hdr[12] = period >> 24; hdr[13] = period >> 16; hdr[14] = period >> 8; hdr[15] = period;
+	hdr[8] = t0 >> 24; hdr[9] = t0 >> 16; hdr[10] = t0 >> 8; hdr[11] = t0;
+	hdr[12] = iq_rx_idx >> 24; hdr[13] = iq_rx_idx >> 16; hdr[14] = iq_rx_idx >> 8; hdr[15] = iq_rx_idx;
 	hdr[16] = n >> 8; hdr[17] = n;
 	hdr[18] = src >> 8; hdr[19] = src;
 	iq_seq++;
 
+	/* 18 bits par échantillon, rangés bout à bout (4 échantillons = 9 octets) */
 	for (i = 0; i < n; i++) {
-		v = ioread32_mac(src);
-		p[0] = v >> 16; p[1] = v >> 8; p[2] = v;
-		p += 3;
-		t += period;
 		while ((a_int32_t)(iq_ccount() - t) < 0)
 			;
+		v = ioread32_mac(src) & 0x3ffff;
+		acc = (acc << 18) | v;
+		bits += 18;
+		do {
+			bits -= 8;
+			*p++ = acc >> bits;
+		} while (bits >= 8);
+		t += period;
 	}
+	if (bits)
+		*p++ = acc << (8 - bits);
 	p[0] = p[1] = p[2] = p[3] = 0;	/* place du FCS, retiré par l'hôte */
+	iq_rx_next = t;
+	iq_rx_idx += n;
+	iq_rx_t_end = iq_ccount();
 
 	adf_os_mem_set(&rs, 0, sizeof(rs));
 	rs.rs_tstamp = iq_seq;
@@ -1607,9 +1653,13 @@ static void iq_poll(void)
 	adf_os_mem_set(p, 0, sizeof(struct rx_frame_header));
 	adf_os_mem_copy(p, &rs, sizeof(rs));
 
-	iq_inflight = skb;
+	if (!iq_inflight[0])
+		iq_inflight[0] = skb;
+	else
+		iq_inflight[1] = skb;
 	iq_cnt[2]++;
 	HTC_SendMsg(sc->tgt_htc_handle, RX_ENDPOINT_ID, skb);
+	iq_rx_stat[0] = iq_ccount() - iq_rx_t_end;	/* durée de l'appel d'envoi */
 }
 
 /* ---- flux d'émission ---- */
@@ -1772,6 +1822,9 @@ static a_uint32_t iq_virtual_read(a_uint32_t addr)
 	case 0x4c: iq_tx_alloc(); return iq_tx_size;
 	case 0x50: return iq_mem_free();
 	case 0x54: return iq_tx_safe_top2;
+	case 0x5c: return iq_rx_stat[0];
+	case 0x60: return iq_rx_stat[1];
+	case 0x64: return iq_rx_stat[2];
 	case 0x58: return iq_tx_on;
 	case 0x28: return iq_cnt[0];
 	case 0x2c: return iq_cnt[1];
@@ -1800,6 +1853,9 @@ static void iq_virtual_write(a_uint32_t addr, a_uint32_t val)
 	case 0x14: iq_lab.repeat = val; break;
 	case 0x18:
 		if (val == 3) {
+			iq_rx_grid = 0;
+			iq_rx_idx = 0;
+			iq_rx_stat[2] = 0;
 			iq_rx_on = 1;
 			lab_poll_hook = lab_poll;
 		} else if (val == 4) {
@@ -2401,7 +2457,7 @@ a_int32_t ath_tgt_attach(a_uint32_t devid, struct ath_softc_tgt *sc, adf_os_devi
 
 	BUF_Pool_create_pool(sc->pool_handle, POOL_ID_WLAN_RX_BUF, ath_numrxdescs, 1664);
 	/* flux I/Q : réserve à part, sinon l'anneau de réception absorbe tout tampon libre */
-	BUF_Pool_create_pool(sc->pool_handle, IQ_POOL_ID, 1, 1664);
+	BUF_Pool_create_pool(sc->pool_handle, IQ_POOL_ID, 2, 1664);
 
 	ath_tgt_txq_setup(sc);
 	sc->sc_imask =0;
