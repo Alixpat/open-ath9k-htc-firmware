@@ -154,3 +154,29 @@ ce rate fixe au lieu du rate control dynamique.
 ## Licence
 
 Voir [LICENCE.TXT](LICENCE.TXT) — ClearBSD pour le code Atheros, MIT pour Tensilica, GPLv2 pour les fichiers ECOS.
+
+## Branche `iq` : la clé AR9271 en radio logicielle
+
+Cette branche ajoute au firmware de quoi lire et écrire les échantillons bruts de la radio, par les
+registres de test du baseband :
+
+- des « registres virtuels » (adresse `0x49510000`), servis par les commandes WMI de lecture/écriture de
+  registres : capture et relecture rapides d'un registre, réglages et compteurs des flux ;
+- un flux I/Q continu en réception : blocs d'échantillons de l'ADC (`0x9c24`) envoyés à l'hôte comme
+  des trames de données reçues (émetteur `02:49:51:00:00:01`), jusqu'à 1 Méch/s ;
+- un flux I/Q continu en émission : les trames de données destinées à `02:49:51:00:00:02` ne sont pas
+  émises, leurs échantillons sont joués sur le DAC (`0x983c`), jusqu'à 200 kéch/s, avec arrêt de
+  sécurité après une seconde sans échantillon.
+
+Les tampons de réception Wi‑Fi sont réduits (11 → 5) pour libérer de la mémoire : ce firmware n'est pas
+fait pour un usage Wi‑Fi normal. Tout est dans `target_firmware/wlan/if_ath.c`.
+
+Pilote, outil, module SoapySDR, mesures et précautions :
+[my-rf-lab/hardware/ar9271](https://github.com/Alixpat/my-rf-lab/tree/main/hardware/ar9271) et
+[ath9k-htc-lab](https://github.com/Alixpat/ath9k-htc-lab).
+
+```bash
+make -f Makefile toolchain                      # une fois, 30 à 60 min
+make -f Makefile -C target_firmware
+sudo install -m644 target_firmware/htc_9271.fw /lib/firmware/ath9k_htc/htc_9271-1.4.0.fw
+```
